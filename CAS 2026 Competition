@@ -1,0 +1,429 @@
+
+# CAS Predictive Modeling: Full Pipeline with Premium Calculation
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor, XGBClassifier
+from sklearn.metrics import mean_squared_error, r2_score, roc_auc_score
+import statsmodels.api as sm
+
+
+data = pd.read_excel("/Users/thinurishehara/Downloads/06 - CAS Predictive Modeling Case Competition- Dataset-2.xlsx")
+
+# Preprocessing
+
+data['sprinklered'] = data['sprinklered'].astype(int)
+data['claim_occurred'] = (data['amount'] > 0).astype(int)
+data = data.rename(columns={'class': 'student_class'})  # avoid Python keyword issues
+
+# Map categorical variables to numeric
+class_mapping = {'Freshman': 1, 'Sophomore': 2, 'Junior': 3, 'Senior': 4, 'Grad student':5}
+data['student_class_num'] = data['student_class'].map(class_mapping)
+data['greek_bin'] = data['greek'].map({'Non-greek': 0, 'Greek': 1})
+data['off_campus_bin'] = data['off_campus'].map({'On campus': 0, 'Off campus': 1})
+
+# Split data
+train_data = data[data['holdout'] == False].copy()
+holdout_data = data[data['holdout'] == True].copy()
+
+# Aggregate to student-level
+student_train = train_data.groupby('student_id').agg(
+    risk_tier=('risk_tier', 'first'),
+    student_class_num=('student_class_num', 'first'),
+    greek_bin=('greek_bin', 'first'),
+    off_campus_bin=('off_campus_bin', 'first'),
+    sprinklered=('sprinklered', 'first'),
+    gpa=('gpa', 'first'),
+    distance_to_campus=('distance_to_campus', 'first'),
+    claim_occurred=('claim_occurred', 'max'),
+    total_claim_amount=('amount', 'sum')
+).reset_index()
+
+severity_data = student_train[student_train['total_claim_amount'] > 0]
+
+
+# Features
+freq_features = ['risk_tier', 'student_class_num', 'greek_bin', 'off_campus_bin', 'sprinklered', 'gpa', 'distance_to_campus']
+X_train = student_train[freq_features].apply(pd.to_numeric)
+y_freq = student_train['claim_occurred'].astype(int)
+
+# Frequency Model (XGBoost)
+xgb_freq = XGBClassifier(eval_metric='logloss', random_state=42)
+xgb_freq.fit(X_train, y_freq)
+student_train['pred_claim_prob_xgb'] = xgb_freq.predict_proba(X_train)[:, 1]
+print("Frequency model AUC (train):", roc_auc_score(y_freq, student_train['pred_claim_prob_xgb']))
+
+# Frequency Model (Logit)
+X_train_logit = sm.add_constant(X_train, has_constant='add')  # Add intercept
+logit_model = sm.Logit(y_freq, X_train_logit).fit()
+print(logit_model.summary())
+
+# Severity Model (XGBoost)
+sev_X = X_train.loc[severity_data.index]
+sev_y = severity_data['total_claim_amount']
+
+xgb_sev = XGBRegressor(random_state=42)
+xgb_sev.fit(sev_X, sev_y)
+student_train['pred_claim_amount_xgb'] = xgb_sev.predict(X_train)
+student_train['pred_claim_amount_xgb'] = np.clip(student_train['pred_claim_amount_xgb'], 0, None)
+
+# Expected loss
+student_train['expected_loss_xgb'] = student_train['pred_claim_prob_xgb'] * student_train['pred_claim_amount_xgb']
+
+# Base Rates and Premiums
+base_rates = {1: 100, 2: 150, 3: 200}
+student_train['base_rate'] = student_train['risk_tier'].map(base_rates)
+
+student_train['loss_multiplier'] = student_train.groupby('risk_tier')['expected_loss_xgb'].transform(
+    lambda x: 1 + (x - x.min()) / (x.max() - x.min())
+)
+student_train['loss_multiplier'] = student_train['loss_multiplier'].clip(0.5, 3.0)
+student_train['premium'] = student_train['base_rate'] * student_train['loss_multiplier']
+
+# Random Forest as alternative (optional)
+rf_model = RandomForestRegressor(n_estimators=200, random_state=42)
+rf_model.fit(X_train, student_train['expected_loss_xgb'])
+student_train['expected_loss_rf'] = rf_model.predict(X_train)
+
+rmse_rf = np.sqrt(mean_squared_error(student_train['expected_loss_xgb'], student_train['expected_loss_rf']))
+r2_rf = r2_score(student_train['expected_loss_xgb'], student_train['expected_loss_rf'])
+print("Random Forest RMSE:", rmse_rf)
+print("Random Forest R²:", r2_rf)
+
+# Top Students by Premium
+top_students = student_train.sort_values('premium', ascending=False)
+print(top_students[['student_id', 'risk_tier', 'expected_loss_xgb', 'base_rate', 'loss_multiplier', 'premium']].head(10))
+
+# Holdout Predictions
+student_holdout = holdout_data.groupby('student_id').agg(
+    risk_tier=('risk_tier', 'first'),
+    student_class_num=('student_class_num', 'first'),
+    greek_bin=('greek_bin', 'first'),
+    off_campus_bin=('off_campus_bin', 'first'),
+    sprinklered=('sprinklered', 'first'),
+    gpa=('gpa', 'first'),
+    distance_to_campus=('distance_to_campus', 'first')
+).reset_index()
+
+X_holdout = student_holdout[freq_features].apply(pd.to_numeric)
+X_holdout = X_holdout.reindex(columns=X_train.columns, fill_value=0)
+
+student_holdout['pred_claim_prob_xgb'] = xgb_freq.predict_proba(X_holdout)[:, 1]
+student_holdout['pred_claim_amount_xgb'] = xgb_sev.predict(X_holdout)
+student_holdout['pred_claim_amount_xgb'] = np.clip(student_holdout['pred_claim_amount_xgb'], 0, None)
+student_holdout['expected_loss_xgb'] = student_holdout['pred_claim_prob_xgb'] * student_holdout['pred_claim_amount_xgb']
+
+student_holdout['base_rate'] = student_holdout['risk_tier'].map(base_rates)
+student_holdout['loss_multiplier'] = student_holdout.groupby('risk_tier')['expected_loss_xgb'].transform(
+    lambda x: 1 + (x - x.min()) / (x.max() - x.min())
+)
+student_holdout['loss_multiplier'] = student_holdout['loss_multiplier'].clip(0.5, 3.0)
+student_holdout['premium'] = student_holdout['base_rate'] * student_holdout['loss_multiplier']
+
+print(student_holdout[['student_id', 'risk_tier', 'expected_loss_xgb', 'base_rate', 'loss_multiplier', 'premium']].head(10))
+
+
+# CAS Predictive Modeling: Key Visualizations
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from sklearn.metrics import roc_curve, auc
+
+# Set global style
+sns.set(style="whitegrid", palette="muted", font_scale=1.1)
+
+
+# Claim Frequency Overview
+plt.figure(figsize=(8,5))
+sns.barplot(
+    x='risk_tier',
+    y='claim_occurred',
+    data=student_train,
+    estimator=np.mean,
+    palette="coolwarm"
+)
+plt.ylabel('Probability of Claim')
+plt.xlabel('Risk Tier')
+plt.title('Claim Frequency by Risk Tier', fontsize=14)
+plt.ylim(0, 1)
+plt.show()
+
+plt.figure(figsize=(6,5))
+sns.barplot(
+    x='greek_bin',
+    y='claim_occurred',
+    data=student_train,
+    estimator=np.mean,
+    palette="Set2"
+)
+plt.ylabel('Probability of Claim')
+plt.xlabel('Greek Student (0=No, 1=Yes)')
+plt.title('Claim Frequency by Greek Affiliation', fontsize=14)
+plt.ylim(0, 1)
+plt.show()
+
+# Claim Severity Overview
+
+plt.figure(figsize=(8,5))
+sns.boxplot(
+    x='risk_tier',
+    y='total_claim_amount',
+    data=student_train,
+    palette="viridis"
+)
+plt.ylabel('Total Claim Amount ($)')
+plt.xlabel('Risk Tier')
+plt.title('Claim Severity by Risk Tier', fontsize=14)
+plt.ylim(0, student_train['total_claim_amount'].quantile(0.95))  # focus on main range
+plt.show()
+
+plt.figure(figsize=(6,5))
+sns.boxplot(
+    x='off_campus_bin',
+    y='total_claim_amount',
+    data=student_train,
+    palette="magma"
+)
+plt.ylabel('Total Claim Amount ($)')
+plt.xlabel('Off-Campus (0=No, 1=Yes)')
+plt.title('Claim Severity by Off-Campus Status', fontsize=14)
+plt.ylim(0, student_train['total_claim_amount'].quantile(0.95))
+plt.show()
+
+# Predicted Expected Loss vs Premium
+
+plt.figure(figsize=(8,5))
+sns.scatterplot(
+    x='expected_loss_xgb',
+    y='premium',
+    hue='risk_tier',
+    palette='viridis',
+    data=student_train,
+    s=80,
+    alpha=0.8
+)
+plt.xlabel('Predicted Expected Loss ($)')
+plt.ylabel('Calculated Premium ($)')
+plt.title('Premiums vs Predicted Expected Loss by Risk Tier', fontsize=14)
+plt.legend(title='Risk Tier', loc='upper left')
+plt.show()
+
+# Top Students by Premium
+top_students = student_train.sort_values('premium', ascending=False).head(10)
+plt.figure(figsize=(10,5))
+sns.barplot(
+    x='student_id',
+    y='premium',
+    hue='risk_tier',
+    data=top_students,
+    palette='Set2',
+    dodge=False
+)
+plt.xlabel('Student ID')
+plt.ylabel('Premium ($)')
+plt.title('Top 10 Students by Premium', fontsize=14)
+plt.legend(title='Risk Tier')
+plt.show()
+
+# Frequency Model Performance (ROC)
+fpr, tpr, thresholds = roc_curve(student_train['claim_occurred'], student_train['pred_claim_prob_xgb'])
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, color='darkorange', lw=3, label=f'ROC curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', linestyle='--', lw=2)
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Frequency Model ROC Curve', fontsize=14)
+plt.legend(loc='lower right')
+plt.show()
+
+# Severity Model Performance (Predicted vs Actual)
+sev_y = student_train[student_train['total_claim_amount'] > 0]['total_claim_amount']
+sev_X = X_train.loc[sev_y.index]
+pred_sev = xgb_sev.predict(sev_X)
+
+plt.figure(figsize=(6,6))
+plt.scatter(sev_y, pred_sev, alpha=0.6, color='teal', edgecolors='k')
+plt.plot([0, sev_y.max()], [0, sev_y.max()], 'r--', lw=2)
+plt.xlabel('Actual Total Claim Amount ($)')
+plt.ylabel('Predicted Total Claim Amount ($)')
+plt.title('Severity Model: Predicted vs Actual', fontsize=14)
+plt.show()
+
+
+import plotly.express as px
+import plotly.graph_objects as go
+
+
+# CAS Predictive Modeling: Key Visualizations
+
+# Distribution of predicted claim probability by risk tier
+fig1 = px.violin(student_train,
+                 x='risk_tier',
+                 y='pred_claim_prob_xgb',
+                 color='risk_tier',
+                 box=True,
+                 points='all',
+                 color_discrete_sequence=px.colors.qualitative.Pastel)
+fig1.update_layout(title='Predicted Claim Probability by Risk Tier',
+                   xaxis_title='Risk Tier',
+                   yaxis_title='Predicted Probability')
+fig1.show()
+
+# Predicted claim amount vs GPA (color by greek)
+fig2 = px.scatter(student_train,
+                  x='gpa',
+                  y='pred_claim_amount_xgb',
+                  color='greek_bin',
+                  hover_data=['student_id', 'risk_tier'],
+                  color_discrete_map={0: 'blue', 1: 'orange'})
+fig2.update_layout(title='Predicted Claim Amount vs GPA',
+                   xaxis_title='GPA',
+                   yaxis_title='Predicted Claim Amount')
+fig2.show()
+
+# Premium distribution by off-campus status
+fig3 = px.box(student_train,
+              x='off_campus_bin',
+              y='premium',
+              color='off_campus_bin',
+              color_discrete_map={0: 'green', 1: 'red'},
+              points='all')
+fig3.update_layout(title='Premium Distribution by On-Campus vs Off-Campus',
+                   xaxis_title='Off-Campus (0=On, 1=Off)',
+                   yaxis_title='Premium')
+fig3.show()
+
+# Expected loss heatmap by risk tier and student class
+heatmap_data = student_train.groupby(['risk_tier', 'student_class_num'])['expected_loss_xgb'].mean().reset_index()
+fig4 = px.density_heatmap(heatmap_data,
+                          x='risk_tier',
+                          y='student_class_num',
+                          z='expected_loss_xgb',
+                          color_continuous_scale='Viridis')
+fig4.update_layout(title='Average Expected Loss by Risk Tier and Student Class',
+                   xaxis_title='Risk Tier',
+                   yaxis_title='Student Class')
+fig4.show()
+
+# Premium vs Expected Loss (with sprinklered status)
+fig5 = px.scatter(student_train,
+                  x='expected_loss_xgb',
+                  y='premium',
+                  color='sprinklered',
+                  color_discrete_map={0: 'purple', 1: 'yellow'},
+                  hover_data=['student_id', 'risk_tier', 'gpa'])
+fig5.update_layout(title='Premium vs Expected Loss by Sprinklered Status',
+                   xaxis_title='Expected Loss',
+                   yaxis_title='Premium')
+fig5.show()
+
+# Top 20 students by premium (bar chart)
+top20 = student_train.nlargest(20, 'premium')
+fig6 = px.bar(top20,
+              x='student_id',
+              y='premium',
+              color='risk_tier',
+              text='premium',
+              color_discrete_sequence=px.colors.qualitative.Set2)
+fig6.update_layout(title='Top 20 Students by Premium',
+                   xaxis_title='Student ID',
+                   yaxis_title='Premium')
+fig6.show()
+
+
+import plotly.express as px
+import plotly.graph_objects as go
+
+
+# Top 20 Most Likely to Claim
+
+top_claimers = student_train.nlargest(20, 'pred_claim_prob_xgb')
+fig1 = px.bar(top_claimers,
+              x='student_id',
+              y='pred_claim_prob_xgb',
+              color='risk_tier',
+              text='pred_claim_prob_xgb',
+              color_continuous_scale=px.colors.sequential.Viridis)
+fig1.update_layout(title='Top 20 Students Most Likely to File a Claim',
+                   xaxis_title='Student ID',
+                   yaxis_title='Predicted Probability of Claim')
+fig1.show()
+
+
+# Claim Probability by Greek Status & Off-Campus
+
+fig2 = px.box(student_train,
+              x='greek_bin',
+              y='pred_claim_prob_xgb',
+              color='off_campus_bin',
+              points='all',
+              color_discrete_map={0:'blue', 1:'red'})
+fig2.update_layout(title='Claim Probability by Greek Status and Off-Campus',
+                   xaxis_title='Greek (0=No,1=Yes)',
+                   yaxis_title='Predicted Claim Probability',
+                   legend_title='Off-Campus (0=On,1=Off)')
+fig2.show()
+
+
+# Expected Loss vs Premium (highlight high-risk students)
+
+fig3 = px.scatter(student_train,
+                  x='expected_loss_xgb',
+                  y='premium',
+                  color='pred_claim_prob_xgb',
+                  size='pred_claim_prob_xgb',
+                  hover_data=['student_id', 'risk_tier', 'gpa'],
+                  color_continuous_scale='Turbo')
+fig3.update_layout(title='Expected Loss vs Premium (size & color = claim probability)',
+                   xaxis_title='Expected Loss',
+                   yaxis_title='Premium')
+fig3.show()
+
+
+# Premium Distribution by Risk Tier
+
+fig4 = px.box(student_train,
+              x='risk_tier',
+              y='premium',
+              color='risk_tier',
+              points='all',
+              color_discrete_sequence=px.colors.qualitative.Set2)
+fig4.update_layout(title='Premium Distribution by Risk Tier',
+                   xaxis_title='Risk Tier',
+                   yaxis_title='Premium')
+fig4.show()
+
+# High-Risk Student Heatmap (GPA vs Risk Tier)
+
+heatmap_data = student_train.groupby(['risk_tier', 'student_class_num'])['pred_claim_prob_xgb'].mean().reset_index()
+fig5 = px.density_heatmap(heatmap_data,
+                          x='risk_tier',
+                          y='student_class_num',
+                          z='pred_claim_prob_xgb',
+                          color_continuous_scale='OrRd')
+fig5.update_layout(title='Average Predicted Claim Probability by Risk Tier and Student Class',
+                   xaxis_title='Risk Tier',
+                   yaxis_title='Student Class')
+fig5.show()
+
+
+# Greek vs Off-Campus: Expected Loss
+
+loss_summary = student_train.groupby(['greek_bin','off_campus_bin']).agg(avg_expected_loss=('expected_loss_xgb','mean')).reset_index()
+fig6 = px.bar(loss_summary,
+              x='greek_bin',
+              y='avg_expected_loss',
+              color='off_campus_bin',
+              barmode='group',
+              text='avg_expected_loss',
+              color_discrete_map={0:'green',1:'orange'})
+fig6.update_layout(title='Average Expected Loss by Greek Status and On/Off Campus',
+                   xaxis_title='Greek (0=No,1=Yes)',
+                   yaxis_title='Average Expected Loss',
+                   legend_title='Off-Campus (0=On,1=Off)')
+fig6.show()
